@@ -37,8 +37,8 @@ gh repo create cptdazbackup --public
 git remote add origin https://github.com/cpinotossi/cptdazbackup.git
 git status
 git add .
-git commit -m""
-git push origin master
+git commit -m"init"
+git push origin main
 
 git tag //list local repo tags
 git ls-remote --tags origin //list remote repo tags
