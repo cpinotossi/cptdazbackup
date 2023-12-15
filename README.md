@@ -14,6 +14,13 @@ az deployment group create -g $prefix -w -n $prefix -p prefix=$prefix location=$
 
 ## azure disk & snapshot copy protection
 
+> **Note:** Deployment has been done partly with bicep partly via the Azure portal. I will fix this in the future to be pure bicep.
+
+usefull links:
+- [how to get it done with bicep](https://stackoverflow.com/questions/68385774/how-to-set-os-disks-networking-to-allowprivate-private-endpoint-through-disk)
+- [protect os disk issue](https://github.com/Azure/azure-rest-api-specs/issues/21325)
+
+### Azure Disk & Snapshot Copy Protection
 The networkAccessPolicy and publicNetworkAccess properties of an Azure Disk control how the disk can be accessed over the network.
 
 networkAccessPolicy: This property can have one of three values:
@@ -27,27 +34,34 @@ publicNetworkAccess: This property can have one of two values:
  1. Enabled: The disk can be accessed from the public internet.
  2. Disabled: The disk cannot be accessed from the public internet.
 
+### Test Cases
 We will run through several SAS Copy cases which tries to cover all possible variations of how to configure snapshot network access policy in a table
 
-| Case | Source | Destination | networkAccessPolicy | publicNetworkAccess |Disk Access Resource | Private Endpoint | HTTP Result |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | vm2Snap1Id | local PC | AllowAll | Enabled | none | none | 200 |
-| 2 | vm2Snap2Id | vm2Snap2IdWEU | AllowPrivate | Enabled | vm2DiskAccess1Id | vm2pe1Id | OK |
-| 3 | vm2Snap2Id | local PC | AllowPrivate | Enabled | vm2DiskAccess1Id | vm2pe1Id | 403 |
-| 4 | vm2Snap2Id | vm2 | AllowPrivate | Enabled | vm2DiskAccess1Id | vm2pe1Id | 200 |
-| 5 | vm2Snap2Id | vm1 | AllowPrivate | Enabled | vm2DiskAccess1Id | vm2pe1Id | 403 |
-| 6 | vm2Snap3Id | local PC | AllowAll | Disable | none | none | NOK |
-| 7 | vm2Snap3Id | vm2Snap3IdWEU | AllowAll | Disable | none | none | OK |
-| 8 | vm2Snap3Id | vm1 | AllowAll | Disable | none | none | NOK |
-| 9 | vm2Snap3Id | vm2 | AllowAll | Disable | none | none | 409 Access not permitted|
-| 10 | vm2Disk2_1Id | local PC | AllowAll | Enabled | none | none | 200 |
-| 11 | vm2Disk2_2Id | local PC | AllowAll | Disable | none | none | 409 Access not permitted |
-| 12 | vm2Disk2_2Id | vm2 | AllowAll | Disable | none | none | 409 Access not permitted |
-| 13 | vm2DiskId | vm2 | AllowPrivate | Enabled | vm2DiskAccess1Id | vm2pe1Id | 409 attached |
-| 14 | vm2Disk2_3Id | vm2 | AllowPrivate | Disable | vm2DiskAccess1Id | vm2pe1Id | 200 |
-| 15 | vm2Disk2_3Id | vm1 | AllowPrivate | Disable | vm2DiskAccess1Id | vm2pe1Id | 200 | 
-| 16 | vm2Disk2_3Id | vm3 | AllowPrivate | Disable | vm2DiskAccess1Id | vm2pe1Id | 403 |
+Environment:
+~~~mermaid
+flowchart LR 
+vnet1 <--Peering--> vnet2
+vnet3 <--Peering--> vnet2
+vnet1[vnet1
+Sub#1
+vm1 10.1.0.4]
+vnet2[vnet2
+Sub#1
+vm2 10.2.0.4
+disk2
+PE 10.2.0.5
+diskAccess]
+vnet3[vnet3
+Sub#2
+vm3 10.3.0.4
+]
+~~~
 
+| Case | Source | Subscription | Destination | networkAccessPolicy | publicNetworkAccess |Disk Access Resource | Private Endpoint | HTTP Result |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | vm2SnapId | sub1 | local PC | AllowPrivate | Disable | vm2DiskAccess1Id | vm2pe1Id | 403 |
+| 2 | vm2SnapId | sub1 | vm1 | AllowPrivate | Disable | vm2DiskAccess1Id | vm2pe1Id | 200 |
+| 3 | vm2SnapId | sub2 | vm3 | AllowPrivate | Disable | vm2DiskAccess1Id | vm2pe1Id | 200 |
 
 ### Create Azure Resources with Azure Bicep Resource Templates and Azure CLI
 ~~~bash
@@ -62,320 +76,107 @@ az group create -n $prefix -l $location
 az deployment group create -g $prefix --template-file ./bicep/infra.bicep --parameters prefix=$prefix currentUserObjectId=$currentUserObjectId 
 ~~~
 
-
-
-### Case#1 snapshot is not secured
-
-~~~bash 
-# get the disc ID
-# az account set --subscription "sub-myedge-01"
-vm2DiskId=$(az vm show -g $prefix --name ${prefix}2 --query "storageProfile.osDisk.managedDisk.id" -o tsv)
-# Create the snapshot
-az snapshot create -g $prefix -n ${prefix}vm2snap1 --source $vm2DiskId --incremental true --sku Standard_ZRS
-# Show the snapshot
-vm2Snap1Id=$(az snapshot show -g $prefix -n ${prefix}vm2snap1 --query id -o tsv)
-# show disk access details
-az snapshot show --ids $vm2Snap1Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-# Get the disk ID
-az snapshot show -g $prefix -n ${prefix}vm2snap1 --query creationData.sourceResourceId
-# copy the snapshot to a different region
-az snapshot create -g $prefix -n ${prefix}vm2snap1WEU -l westeurope --source $vm2Snap1Id --incremental --copy-start
-# Export/Copy a snapshot to a storage account in different region with CLI
-vm2Snap1SASUrl=$(az snapshot grant-access --ids $vm2Snap1Id --duration-in-seconds 3600 --query accessSas -o tsv)
-curl -o /dev/null -s -w "%{http_code}\n" -I $vm2Snap1SASUrl # should return 200
-~~~
-
-### Cse#2 Secure the snapshot with private link.
-Based on https://learn.microsoft.com/en-us/azure/virtual-machines/linux/disks-export-import-private-links-cli
+### Create disk access resource and private endpoint
 
 ~~~bash
-# create disk access resource
+# Create a disk access resource which will be used to secure the snapshot by private link
 az disk-access create -n ${prefix}vm2diskaccess1 -g $prefix -l $location
-vm2DiskAccess1=$(az disk-access show -n ${prefix}vm2diskaccess1 -g $prefix --query id -o tsv)
-# Azure deploys resources to a subnet within a virtual network, so you need to update the subnet to disable private endpoint network policies.
-az network vnet subnet show -g $prefix --name ${prefix}2 --vnet-name ${prefix}2 --query privateEndpointNetworkPolicies # should be "Disabled"
-az network vnet subnet update -g $prefix --name ${prefix}2 --vnet-name ${prefix}2 --disable-private-endpoint-network-policies true # This command is not really needed if the subnet is setup with default values.
-az network vnet subnet show -g $prefix --name ${prefix}2 --vnet-name ${prefix}2 --query privateEndpointNetworkPolicies # should be "Disabled"
-
+# Get the disk access resource id which will be used during the snapshot creation
+diskAccess=$(az disk-access show -n ${prefix}vm2diskaccess1 -g $prefix --query id -o tsv)
 # Create a private endpoint for the disk access object
 az network private-endpoint create -g $prefix --name ${prefix}vm2pe1 --vnet-name ${prefix}2 --subnet ${prefix}2 --private-connection-resource-id $vm2DiskAccess1 --group-ids disks --connection-name ${prefix}vm2pecon1
 vm2pe1Id=$(az network private-endpoint show -g $prefix --name ${prefix}vm2pe1 --query id -o tsv)
 # Create a private DNS zone for the disk access object
 az network private-dns zone create -g $prefix --name "privatelink.blob.core.windows.net"
+# Assign pdns to vnet1
+az network private-dns link vnet create -g $prefix --zone-name "privatelink.blob.core.windows.net" --name ${prefix}1dnslink1 --virtual-network ${prefix}1 --registration-enabled false
+# Assign pdns to vnet2
 az network private-dns link vnet create -g $prefix --zone-name "privatelink.blob.core.windows.net" --name ${prefix}2dnslink1 --virtual-network ${prefix}2 --registration-enabled false
+# switch subscription
+az account set --subscription "sub-myedge-01"
+# Assign pdns to vnet3 in a different subscription
+vnet3Id=$(az network vnet show -g $prefix -n ${prefix}3 --query id -o tsv)
+# switch subscription
+az account set --subscription "vse-sub"
+az network private-dns link vnet create -g $prefix --zone-name "privatelink.blob.core.windows.net" --name ${prefix}3dnslink1 --virtual-network $vnet3Id --registration-enabled false
+# Assing the private endpoint to the private DNS zone via an dns-zone-group
 az network private-endpoint dns-zone-group create -g $prefix --endpoint-name ${prefix}vm2pe1 --name ${prefix}2 --private-dns-zone "privatelink.blob.core.windows.net" --zone-name disks
-
-# Assign the Disk Access resource to the disk
-az disk update --ids $vm2DiskId --network-access-policy AllowPrivate --disk-access $vm2DiskAccess1
-
-# Create again a snaphot
-az snapshot update -h -g $prefix -n ${prefix}vm2snap2 --source $vm2DiskId --incremental true --sku Standard_ZRS #works
-
-# retrieve the snapshot ID
-vm2Snap2Id=$(az snapshot show -g $prefix -n ${prefix}vm2snap2 --query id -o tsv)
-# Change the network access policy to allow private access only
-az snapshot update --ids $vm2Snap2Id --network-access-policy AllowPrivate
-az snapshot show --ids $vm2Snap2Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-# Export/Copy a snapshot to a storage account in different region with CLI
-vm2Snap2SASUrl=$(az snapshot grant-access --ids $vm2Snap2Id --duration-in-seconds 3600 --query accessSas -o tsv)
-echo $vm2Snap2SASUrl
-curl -o /dev/null -s -w "%{http_code}\n" -I $vm2Snap2SASUrl # should return 403
+# list all vnets which are linked to the private DNS zone
+az network private-dns link vnet list -g $prefix --zone-name "privatelink.blob.core.windows.net" --query "[].{name:name, virtualNetwork:virtualNetwork.id}" | sed 's|/subscriptions/.*/providers||g'
 ~~~
 
-### Cse#3 Copy the snapshot to a different region.
-NOTE: We will still be able to copy the snapshot from one region to another.
+Output should look as follow:
+
+~~~json
+[
+  {
+    "name": "cptdazdisk1dnslink1",
+    "virtualNetwork": "/Microsoft.Network/virtualNetworks/cptdazdisk1"
+  },
+  {
+    "name": "cptdazdisk2dnslink1",
+    "virtualNetwork": "/Microsoft.Network/virtualNetworks/cptdazdisk2"
+  },
+  {
+    "name": "cptdazdisk3dnslink1",
+    "virtualNetwork": "/Microsoft.Network/virtualNetworks/cptdazdisk3"
+  }
+]
+~~~
+
+### Create snapshot from disk2 with private link enabled
 
 ~~~bash
-# We will need to create a new disk access resource in the target region as this is a hard requirement for the copy operation.
-az disk-access create -n ${prefix}vm2diskaccess1WEU -g $prefix -l westeurope
-vm2DiskAccess1IdWEU=$(az disk-access show -n ${prefix}vm2diskaccess1WEU -g $prefix --query id -o tsv)
-# copy the snapshot to a different region
-az snapshot create -g $prefix -n ${prefix}vm2snap2_2WEU -l westeurope --source $vm2Snap2Id --incremental --copy-start --disk-access $vm2DiskAccess1IdWEU # works
-~~~
-
-### Cse#4 Secure the snapshot with private link and access from inside same vnet and subnet
-
-~~~bash
-# login to the VM
-vm2Id=$(az vm show -g $prefix -n ${prefix}2 --query id -o tsv)
-az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm2Id --auth-type AAD
-
-# install azure cli
-curl -sL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg > /dev/null
-AZ_REPO=$(lsb_release -cs)
-echo "deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ $AZ_REPO main" | sudo tee /etc/apt/sources.list.d/azure-cli.list
-sudo apt-get update
-sudo apt-get install azure-cli -y
-az login --use-device-code
-
-# inside the vm we need to setup the environment varaibles again.
-prefix=cptdazdisk
-# retrieve the disk access resource id
-vm2Snap2Id=$(az snapshot show -g $prefix -n ${prefix}vm2snap2 --query id -o tsv)
-# Change the network access policy to allow private access only
-az snapshot show --ids $vm2Snap2Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-
-# Export/Copy a snapshot to a storage account in different region with CLI
-vm2Snap2SASUrl=$(az snapshot grant-access --ids $vm2Snap2Id --duration-in-seconds 3600 --query accessSas -o tsv)
-curl -o /dev/null -s -w "%{http_code}\n" -I $vm2Snap2SASUrl # expect 200 OK
-logout
-~~~
-
-### Case#5 Secure the snapshot with private link and access from different vnet and subnet
-
-~~~bash
-# login to the VM
-vm1Id=$(az vm show -g $prefix -n ${prefix}1 --query id -o tsv)
-az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm1Id --auth-type AAD
-
-# install azure cli
-curl -sL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/microsoft.gpg > /dev/null
-AZ_REPO=$(lsb_release -cs)
-echo "deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ $AZ_REPO main" | sudo tee /etc/apt/sources.list.d/azure-cli.list
-sudo apt-get update
-sudo apt-get install azure-cli -y
-az login --use-device-code # note we should use --indentity to use the VM identity instead of the user identity
-
-# inside the vm we need to setup the environment varaibles again.
-prefix=cptdazdisk
-# retrieve the disk access resource id
-vm2Snap2Id=$(az snapshot show -g $prefix -n ${prefix}vm2snap2 --query id -o tsv)
-# Change the network access policy to allow private access only
-az snapshot show --ids $vm2Snap2Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-
-# Export/Copy a snapshot to a storage account in different region with CLI
-vm2Snap2SASUrl=$(az snapshot grant-access --ids $vm2Snap2Id --duration-in-seconds 3600 --query accessSas -o tsv)
-curl -o /dev/null -s -w "%{http_code}\n" -I $vm2Snap2SASUrl # expect 403 OK
-logout
-~~~
-
-### Case#6 snapshot public access is disabled
-
-~~~bash 
-# get the disc ID
-vm2DiskId=$(az vm show -g $prefix --name ${prefix}2 --query "storageProfile.osDisk.managedDisk.id" -o tsv)
-# Create the snapshot
-vm2Snap3Id=$(az snapshot create -g $prefix -n ${prefix}vm2snap3 --source $vm2DiskId --incremental true --sku Standard_ZRS --query id -o tsv --network-access-policy AllowAll --public-network-access Disabled)
-# show disk access details
-az snapshot show --ids $vm2Snap3Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-# copy the snapshot to a different region
-az snapshot create -g $prefix -n ${prefix}vm2snap3WEU -l westeurope --source $vm2Snap3Id --incremental --copy-start # works
-# Export/Copy a snapshot to a storage account in different region with CLI
-vm2Snap3SASUrl=$(az snapshot grant-access --ids $vm2Snap3Id --duration-in-seconds 3600 --query accessSas -o tsv) # ERROR: (PublicNetworkAccessDisabled) Access not permitted for resource
-~~~
-
-### Case#7 snapshot public access is disabled, export to storage account in different region
-
-~~~bash 
-# copy the snapshot to a different region
-az snapshot create -g $prefix -n ${prefix}vm2snap3WEU -l westeurope --source $vm2Snap3Id --incremental --copy-start # works
-~~~
-
-### Case#8 snapshot public access is disabled, access from different vnet and subnet
-
-~~~bash
-# login to the VM
-vm1Id=$(az vm show -g $prefix -n ${prefix}1 --query id -o tsv)
-az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm1Id --auth-type AAD
-
-az login --identity # note we should use --indentity to use the VM identity instead of the user identity
-
-# inside the vm we need to setup the environment varaibles again.
-prefix=cptdazdisk
-# retrieve the disk access resource id
-vm2Snap3Id=$(az snapshot show -g $prefix -n ${prefix}vm2snap3 --query id -o tsv)
-# Change the network access policy to allow private access only
-az snapshot show --ids $vm2Snap3Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-
-# Export/Copy a snapshot to a storage account in different region with CLI
-az snapshot grant-access --ids $vm2Snap3Id --duration-in-seconds 3600 --debug
-vm2Snap3SASUrl=$(az snapshot grant-access --ids $vm2Snap3Id --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 409 (PublicNetworkAccessDisabled) Access not permitted for resource
-logout
-~~~
-
-### Case#9 snapshot public access is disabled, access from same vnet and subnet
-
-~~~bash
-# login to the VM
-vm2Id=$(az vm show -g $prefix -n ${prefix}2 --query id -o tsv)
-az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm2Id --auth-type AAD
-az login --identity # use the VM identity instead of the user identity
-# inside the vm we need to setup the environment varaibles again.
-prefix=cptdazdisk
-# retrieve the disk access resource id
-vm2Snap3Id=$(az snapshot show -g $prefix -n ${prefix}vm2snap3 --query id -o tsv)
-# Change the network access policy to allow private access only
-az snapshot show --ids $vm2Snap3Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-# Export/Copy a snapshot to a storage account in different region with CLI
-az snapshot grant-access --ids $vm2Snap3Id --duration-in-seconds 3600 --debug
-vm2Snap3SASUrl=$(az snapshot grant-access --ids $vm2Snap3Id --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 409 (PublicNetworkAccessDisabled) Access not permitted for resource
-logout
-~~~
-
-### Case#10 disc public access is enabled access from local PC
-
-~~~bash
-# Create new disk
-az disk create -g $prefix -n ${prefix}2_1 --size-gb 1 --sku Standard_LRS --query id -o tsv
-# Get Disk ID
-disk2_1Id=$(az disk show -g $prefix -n ${prefix}2_1 --query id -o tsv)
-az disk show --ids $disk2_2Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-disk2_1SASUrl=$(az disk grant-access --ids $disk2_1Id --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 409 (PublicNetworkAccessDisabled) Access not permitted for resource
-~~~
-
-### Case#11 disc public access is disabled access from local PC
-
-~~~bash
-# Create new disk
-disk2_2Id=$(az disk create -g $prefix -n ${prefix}2_2 --size-gb 1 --sku Standard_LRS --query id -o tsv --network-access-policy AllowAll --public-network-access Disabled)
-az disk show --ids $disk2_2Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-disk2_2SASUrl=$(az disk grant-access --ids $disk2_2Id --duration-in-seconds 3600 --query accessSas -o tsv) 
-curl -o /dev/null -s -w "%{http_code}\n" -I $disk2_2SASUrl # HTTP 409 (PublicNetworkAccessDisabled) Access not permitted for resource
-echo $disk2_2SASUrl
-~~~
-
-### Case#12 disc public access is disabled access from VM2
-
-~~~bash
-vm2Id=$(az vm show -g $prefix -n ${prefix}2 --query id -o tsv)
-az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm2Id --auth-type AAD
-az login --identity # use the VM identity instead of the user identity
-# inside the vm we need to setup the environment varaibles again.
-prefix=cptdazdisk
-disk2_2Id=$(az disk show -n ${prefix}2_2 -g $prefix --query id -o tsv)
-az disk show --ids $disk2_2Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-disk2_2SASUrl=$(az disk grant-access --ids $disk2_2Id --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 409 (PublicNetworkAccessDisabled) Access not permitted for resource
-logout
-~~~
-
-### Case#13 disc public access is disabled access from VM2
-
-~~~bash
-vm2Id=$(az vm show -g $prefix -n ${prefix}2 --query id -o tsv)
-az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm2Id --auth-type AAD
-az login --identity # use the VM identity instead of the user identity
-# inside the vm we need to setup the environment varaibles again.
-prefix=cptdazdisk
+# Get the disk ID which will be used during the snapshot creation
 disk2Id=$(az disk show -g $prefix -n ${prefix}2 --query id -o tsv)
-az disk show --ids $disk2Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-az disk grant-access --ids $disk2Id --duration-in-seconds 3600 --query accessSas -o tsv --debug
-disk2SASUrl=$(az disk grant-access --ids $disk2Id --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 409 disk currently attached to running VM
-logout
+# Lookup the disk access details
+az disk show --ids $disk2Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'| sed 's|/subscriptions/.*/providers||g'
 ~~~
 
-### Case#14 disc public access is disabled access from VM2
+Output should look as follow:
 
-~~~bash
-# Create new disk with disk access resource
-vm2DiskAccess1Id=$(az disk-access show -n ${prefix}vm2diskaccess1 -g $prefix --query id -o tsv)
-az disk create -g $prefix -n ${prefix}2_3 --size-gb 1 --sku Standard_LRS --network-access-policy AllowPrivate --public-network-access Disabled --disk-access $vm2DiskAccess1Id
-# log into the VM2
-vm2Id=$(az vm show -g $prefix -n ${prefix}2 --query id -o tsv)
-az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm2Id --auth-type AAD
-az login --identity # use the VM identity instead of the user identity
-# inside the vm we need to setup the environment varaibles again.
-prefix=cptdazdisk
-disk2_3Id=$(az disk show -g $prefix -n ${prefix}2_3 --query id -o tsv)
-az disk show --ids $disk2_3Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-az disk grant-access --ids $disk2_3Id --duration-in-seconds 3600 --query accessSas -o tsv --debug
-disk2_3SASUrl=$(az disk grant-access --ids $disk2_3Id --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 200 running VM
-curl -o /dev/null -s -w "%{http_code}\n" -I $disk2_3SASUrl # HTTP 409 (PublicNetworkAccessDisabled) Access not permitted for resource
-echo $disk2_3SASUrl
-logout
+~~~json
+{
+  "diskAccessId": "/Microsoft.Compute/diskAccesses/cptdazdiskvm2diskaccess1",
+  "networkAccessPolicy": "AllowPrivate",
+  "publicNetworkAccess": "Disabled"
+}
 ~~~
 
-DNS Lookup of SAS URL
+Create the snapshot from disk2 with private link enabled
+
 ~~~bash
-dig md-impexp-qt0gwj0r2bck.z50.blob.storage.azure.net
-md-impexp-qt0gwj0r2bck.z50.blob.storage.azure.net. 40 IN CNAME md-impexp-qt0gwj0r2bck.privatelink.blob.core.windows.net.
-md-impexp-qt0gwj0r2bck.privatelink.blob.core.windows.net. 10 IN A 10.2.0.5
+# Create the snapshot
+disk2SnapId=$(az snapshot create -g $prefix -n ${prefix}vm2snap --source $disk2Id --incremental true --sku Standard_ZRS --network-access-policy AllowPrivate --public-network-access Disabled --disk-access $diskAccess --query id -o tsv)
+# Show the snapshot access details
+az snapshot show --ids $disk2SnapId --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}' | sed 's|/subscriptions/.*/providers||g'
 ~~~
 
-### Case#15 disc public access is disabled access from VM1
+Output should look as follow:
 
-~~~bash
-# log into the VM1
-vm1Id=$(az vm show -g $prefix -n ${prefix}1 --query id -o tsv)
-az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm1Id --auth-type AAD
-az login --identity # use the VM identity instead of the user identity
-# inside the vm we need to setup the environment varaibles again.
-prefix=cptdazdisk
-disk2_3Id=$(az disk show -g $prefix -n ${prefix}2_3 --query id -o tsv)
-az disk show --ids $disk2_3Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-disk2_3SASUrl=$(az disk grant-access --ids $disk2_3Id --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 200 running VM
-curl -o /dev/null -s -w "%{http_code}\n" -I $disk2_3SASUrl # HTTP 200
-echo $disk2_3SASUrl
-dig md-impexp-qt0gwj0r2bck.z50.blob.storage.azure.net # public IP
-logout
+~~~json
+{
+  "diskAccessId": "/Microsoft.Compute/diskAccesses/cptdazdiskvm2diskaccess1",
+  "networkAccessPolicy": "AllowPrivate",
+  "publicNetworkAccess": "Disabled"
+}
 ~~~
 
-### Case#15.1 disc public access is disabled access from VM1 via PE
+### [CASE1] Download Snapshot from my local PC
 
 ~~~bash
-# Assign pdns to vnet1
-az network private-dns link vnet create -g $prefix --zone-name "privatelink.blob.core.windows.net" --name ${prefix}1dnslink1 --virtual-network ${prefix}1 --registration-enabled false
-# log into the VM1
-vm1Id=$(az vm show -g $prefix -n ${prefix}1 --query id -o tsv)
-az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm1Id --auth-type AAD
-az login --identity # use the VM identity instead of the user identity
-# inside the vm we need to setup the environment varaibles again.
-prefix=cptdazdisk
-disk2_3Id=$(az disk show -g $prefix -n ${prefix}2_3 --query id -o tsv)
-az disk show --ids $disk2_3Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-disk2_3SASUrl=$(az disk grant-access --ids $disk2_3Id --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 200 running VM
-curl -o /dev/null -s -w "%{http_code}\n" -I $disk2_3SASUrl # HTTP 200
-echo $disk2_3SASUrl
-dig md-impexp-qt0gwj0r2bck.z50.blob.storage.azure.net # private IP 10.2.0.5
-logout
+disk2SnapSASUrlLocalPC=$(az snapshot grant-access --ids $disk2SnapId --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 200 running VM
+# extract hostname from SAS URL
+disk2SnapSASUrlLocalPCFQDN=$(echo $disk2SnapSASUrlLocalPC | sed 's|https://||g' | sed 's|/.*||g')
+echo $disk2SnapSASUrlLocalPCFQDN
+dig $disk2SnapSASUrlLocalPCFQDN # public IP
+curl -o /dev/null -s -w "%{http_code}\n" -I $disk2SnapSASUrlLocalPC # HTTP 403
 ~~~
 
-### Case#16 disc public access is disabled, networkAccessPolicy   access from VM1 via PE
+### [CASE2] Download Snapshot from VM1 peered with VNET2 where the private link is deployed
 
 ~~~bash
-az disk create --network-access-policy ??
-# Assign pdns to vnet1
-az network private-dns link vnet create -g $prefix --zone-name "privatelink.blob.core.windows.net" --name ${prefix}1dnslink1 --virtual-network ${prefix}1 --registration-enabled false
-# log into the VM1
+# login to the VM
 vm1Id=$(az vm show -g $prefix -n ${prefix}1 --query id -o tsv)
 az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm1Id --auth-type AAD
 
@@ -386,19 +187,39 @@ echo "deb [arch=amd64] https://packages.microsoft.com/repos/azure-cli/ $AZ_REPO 
 sudo apt-get update
 sudo apt-get install azure-cli -y
 
-az login --identity # use the VM identity instead of the user identity
+# login with managed identity of VM1
+az login --identity
+
 # inside the vm we need to setup the environment varaibles again.
 prefix=cptdazdisk
-disk2_3Id=$(az disk show -g $prefix -n ${prefix}2_3 --query id -o tsv)
-az disk show --ids $disk2_3Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-disk2_3SASUrl=$(az disk grant-access --ids $disk2_3Id --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 200 running VM
-curl -o /dev/null -s -w "%{http_code}\n" -I $disk2_3SASUrl # HTTP 200
-echo $disk2_3SASUrl
-dig md-impexp-qt0gwj0r2bck.z50.blob.storage.azure.net # private IP 10.2.0.5
+# retrieve the disk access resource id
+vm2SnapId=$(az snapshot show -g $prefix -n ${prefix}vm2snap --query id -o tsv)
+# Verify snapshit access policy to allow private access only
+az snapshot show --ids $vm2SnapId --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'| sed 's|/subscriptions/.*/providers||g'
+~~~
+
+Output should look as follow:
+~~~json
+{
+  "diskAccessId": "/Microsoft.Compute/diskAccesses/cptdazdiskvm2diskaccess1",
+  "networkAccessPolicy": "AllowPrivate",
+  "publicNetworkAccess": "Disabled"
+}
+~~~
+
+Download via SAS URL
+
+~~~bash
+disk2SnapSASUrlVM1=$(az snapshot grant-access --ids $vm2SnapId --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 200 running VM
+# extract hostname from SAS URL
+disk2SnapSASUrlVM1FQDN=$(echo $disk2SnapSASUrlVM1 | sed 's|https://||g' | sed 's|/.*||g')
+echo $disk2SnapSASUrlVM1FQDN
+dig $disk2SnapSASUrlVM1FQDN # private IP 10.2.0.5
+curl -o /dev/null -s -w "%{http_code}\n" -I $disk2SnapSASUrlVM1 # HTTP 200
 logout
 ~~~
 
-### Case#17 disc public access is disabled, networkAccessPolicy  access from VM3 via PE from different subscription
+### [CASE3] Download Snapshot from VM3 (different Subscription) peered with VNET2 where the private link is deployed
 
 ~~~bash
 # switch subscription
@@ -411,60 +232,25 @@ az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm3Id --auth-
 az login --identity # use the VM identity instead of the user identity
 # inside the vm we need to setup the environment varaibles again.
 prefix=cptdazdisk
-disk2_3Id=$(az disk show -g $prefix -n ${prefix}2_3 --query id -o tsv)
-az disk show --ids $disk2_3Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'
-disk2_3SASUrl=$(az disk grant-access --ids $disk2_3Id --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 200 running VM
-curl -o /dev/null -s -w "%{http_code}\n" -I $disk2_3SASUrl # HTTP 200
-echo $disk2_3SASUrl
-dig md-impexp-qt0gwj0r2bck.z50.blob.storage.azure.net # private IP 10.2.0.5
+# retrieve the disk access resource id
+vm2SnapId=$(az snapshot show -g $prefix -n ${prefix}vm2snap --query id -o tsv)
+disk2SnapSASUrlVM3=$(az snapshot grant-access --ids $vm2SnapId --duration-in-seconds 3600 --query accessSas -o tsv) # HTTP 200 running VM
+# extract hostname from SAS URL
+disk2SnapSASUrlVM3FQDN=$(echo $disk2SnapSASUrlVM3 | sed 's|https://||g' | sed 's|/.*||g')
+echo $disk2SnapSASUrlVM3FQDN
+dig $disk2SnapSASUrlVM3FQDN # private IP 10.2.0.5
+ping 10.2.0.4
+curl -v -I $disk2SnapSASUrlVM3 # HTTP 200
+curl -o /dev/null -s -w "%{http_code}\n" -I $disk2SnapSASUrlVM3 # HTTP 200
 logout
 ~~~
-
-
-
-###
-
-~~~bash
-# Calculate the disk size
-vm2DiskSizeSnapShot=$(az snapshot show -g $prefix -n ${prefix}vm2snap1 --query diskSizeGB -o tsv)
-diskSize=$(expr $vm2DiskSizeSnapShot + 2)
-echo $diskSize
-#Provide the OS type
-osType=linux
-
-#Create a new Managed Disks using the snapshot Id
-az disk create -g $prefix --name ${prefix}1 --sku Standard_LRS --size-gb $diskSize --source $snapId
-
-#Create VM by attaching created managed disks as OS
-az vm create --name ${prefix}1 -g $prefix --attach-os-disk ${prefix}1 --os-type linux --vnet-name $prefix --subnet default 
-
-# Grant read access to the disk
-sas=$(az disk grant-access -n MyDisk -g MyResourceGroup --access-level Read --duration-in-seconds 3600 --query [accessSas] -o tsv)
-
-# Copy the disk to a storage account as a VHD
-az storage blob copy start --destination-blob MyVHD.vhd --destination-container vhds --account-name mystorageaccount --source-uri $sas
-~~~
-
-
-~~~bash
-# Create an disk access resource
-az disk-access create -n ${prefix}1 -g $prefix -l $location
-diskAccessId=$(az disk-access show -n ${prefix}1 -g $prefix --query id -o tsv)
-
-
-# Get VM Id
-vm1Id=$(az vm show -g $prefix -n ${prefix}1 --query id -o tsv)
-vm2Id=$(az vm show -g $prefix -n ${prefix}2 --query id -o tsv)
-az network bastion ssh -n $prefix -g $prefix --target-resource-id $vm1Id --auth-type AAD
-~~~
-
 
 
 
 
 ## Misc
 
-## Git
+### Git
 
 ~~~bash
 
