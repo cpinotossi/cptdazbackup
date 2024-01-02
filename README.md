@@ -14,13 +14,13 @@ az deployment group create -g $prefix -w -n $prefix -p prefix=$prefix location=$
 
 ## azure disk & snapshot copy protection
 
-> **Note:** Deployment has been done partly with bicep partly via the Azure portal. I will fix this in the future to be pure bicep.
 
 usefull links:
 - [how to get it done with bicep](https://stackoverflow.com/questions/68385774/how-to-set-os-disks-networking-to-allowprivate-private-endpoint-through-disk)
 - [protect os disk issue](https://github.com/Azure/azure-rest-api-specs/issues/21325)
 
 ### Azure Disk & Snapshot Copy Protection
+
 The networkAccessPolicy and publicNetworkAccess properties of an Azure Disk control how the disk can be accessed over the network.
 
 networkAccessPolicy: This property can have one of three values:
@@ -34,33 +34,27 @@ publicNetworkAccess: This property can have one of two values:
  1. Enabled: The disk can be accessed from the public internet.
  2. Disabled: The disk cannot be accessed from the public internet.
 
+Sometimes one picture says more than 1000 words, so maybe the following picture helps to understand the concept of Azure Disk & Snapshot Copy Protection
+![Azure Disk & Snapshot Copy Protection](./diskaccess/media/azure.disc.access.object.png)
+
+
 ### Test Cases
 We will run through several SAS Copy cases which tries to cover all possible variations of how to configure snapshot network access policy in a table
 
 Environment:
 ~~~mermaid
 classDiagram 
-vnet1 --> vnet2: peering
-vnet3 --> vnet2: peering
-namespace Subscription1 {
-  class vnet1{
-    +vnet1
-    +vm1 10.1.0.4
-  }
-  class vnet2{
-    +vnet2
-    +vm2 10.2.0.4
-    +disk2
-    +PE 10.2.0.5
-    +diskAccess
-  } 
-}
-namespace Subscription2 {
-  class vnet3{
-    +vnet3
-    +vm3 10.3.0.4
-  }
-}
+vnet1-->vnet2: peering
+vnet3-->vnet2: peering
+vnet1: Subscription1
+vnet1: vm1 10.1.0.4
+vnet1: PE 10.1.0.5
+vnet1: diskAccessObject
+vnet1: disk1
+vnet2: Subscription1
+vnet2: vm1 10.2.0.4
+vnet3: Subscription2
+vnet3: vm1 10.3.0.4
 ~~~
 
 | Case | Source | Subscription | Destination | networkAccessPolicy | publicNetworkAccess |Disk Access Resource | Private Endpoint | HTTP Result |
@@ -108,11 +102,6 @@ az network private-dns link vnet list -g $prefix --zone-name "privatelink.blob.c
 ### Verify if private access is enabled for Disk1
 
 ~~~bash
-# # Get the disk ID which will be used during the snapshot creation
-# disk2Id=$(az disk show -g $prefix -n ${prefix}2 --query id -o tsv)
-# # Lookup the disk access details
-# az disk show --ids $disk2Id --query '{publicNetworkAccess:publicNetworkAccess, networkAccessPolicy:networkAccessPolicy, diskAccessId:diskAccessId}'| sed 's|/subscriptions/.*/providers||g'
-
 # Get the disk ID which will be used during the snapshot creation
 disk1Id=$(az disk show -g $prefix -n ${prefix}1 --query id -o tsv)
 # Lookup the disk access details
@@ -181,7 +170,7 @@ sudo apt-get install azure-cli -y
 az login --identity
 
 # inside the vm we need to setup the environment variables again.
-prefix=cptdazdisk2
+prefix=cptdazdisk
 # retrieve the disk access resource id
 vm1SnapId=$(az snapshot show -g $prefix -n ${prefix}vm1snap --query id -o tsv)
 # Verify snapshit access policy to allow private access only
@@ -229,7 +218,7 @@ sudo apt-get install azure-cli -y
 
 az login --identity # use the VM identity instead of the user identity
 # inside the vm we need to setup the environment varaibles again.
-prefix=cptdazdisk2
+prefix=cptdazdisk
 # switch subscription
 az account set --subscription "sub-myedge-01"
 # retrieve the disk access resource id
