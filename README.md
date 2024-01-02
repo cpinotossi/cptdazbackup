@@ -45,7 +45,7 @@ Environment:
 ~~~mermaid
 classDiagram 
 vnet1-->vnet2: peering
-vnet3-->vnet2: peering
+vnet1-->vnet3: peering
 vnet1: Subscription1
 vnet1: vm1 10.1.0.4
 vnet1: PE 10.1.0.5
